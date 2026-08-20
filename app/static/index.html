@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#111417" />
+  <title>Atlas RAG · 知识操作台</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="rail" aria-label="主导航">
+      <div class="brand-mark" aria-label="Atlas RAG">A<span>/</span></div>
+      <nav class="rail-nav">
+        <button class="rail-link is-active" data-view="ask" aria-label="问答工作台" data-tooltip="问答工作台"><i data-lucide="message-square-more"></i><span>问答</span></button>
+        <button class="rail-link" data-view="library" aria-label="知识库" data-tooltip="知识库"><i data-lucide="library"></i><span>知识库</span></button>
+        <button class="rail-link" data-view="runs" aria-label="运行记录" data-tooltip="运行记录"><i data-lucide="activity"></i><span>运行</span></button>
+      </nav>
+      <div class="rail-bottom">
+        <button class="rail-link" id="settings-button" aria-label="设置" data-tooltip="设置"><i data-lucide="settings-2"></i><span>设置</span></button>
+        <div class="avatar" aria-label="匿名会话">AN</div>
+      </div>
+    </aside>
+
+    <main class="main-stage">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">ATLAS RAG / KNOWLEDGE OPS</p>
+          <h1 id="page-title">问答工作台</h1>
+        </div>
+        <div class="top-actions">
+          <span class="connection-pill" id="connection-status"><span class="status-dot"></span>检查服务中</span>
+          <button class="icon-button" id="new-session" aria-label="新建会话" data-tooltip="新建会话"><i data-lucide="plus"></i></button>
+        </div>
+      </header>
+
+      <section class="view is-visible" id="ask-view">
+        <div class="workspace-grid">
+          <div class="conversation-column">
+            <div class="welcome-line">
+              <div>
+                <span class="section-kicker">LIVE SESSION</span>
+                <h2>把问题交给路由器。</h2>
+                <p>Atlas 会先拆解意图，再为每个任务选择最匹配的 Agent。</p>
+              </div>
+              <div class="session-id" id="session-label">SESSION / NEW</div>
+            </div>
+
+            <div class="prompt-strip">
+              <button class="prompt-chip" data-prompt="公司的知识库里，如何部署 FastAPI 服务？"><i data-lucide="file-search-2"></i>检索内部文档</button>
+              <button class="prompt-chip" data-prompt="比较 Milvus、FAISS 和 BM25 在这个项目里的职责。"><i data-lucide="git-compare-arrows"></i>比较技术方案</button>
+              <button class="prompt-chip" data-prompt="给我一个 Agentic RAG 的最小执行流程。"><i data-lucide="route"></i>梳理执行流程</button>
+            </div>
+
+            <div class="chat-feed" id="chat-feed" aria-live="polite">
+              <article class="message assistant-message welcome-message">
+                <div class="message-meta"><span class="agent-tag"><span class="agent-spark"></span>ATLAS / ORCHESTRATOR</span><time>刚刚</time></div>
+                <p>你好。告诉我你要查什么、比较什么，或者让一个问题穿过完整的 Agentic RAG 流程。</p>
+                <div class="welcome-note"><i data-lucide="scan-search"></i><span>我会展示检索证据、路由选择和评分结果。</span></div>
+              </article>
+            </div>
+
+            <form class="composer" id="composer-form">
+              <div class="composer-topline"><span>QUERY INPUT</span><span id="char-count">0 / 8000</span></div>
+              <textarea id="query-input" rows="3" maxlength="8000" placeholder="输入一个问题，开始一次可追踪的检索…" aria-label="问题"></textarea>
+              <div class="composer-actions">
+                <div class="composer-hints"><span><kbd>Enter</kbd> 发送</span><span><kbd>Shift</kbd><kbd>Enter</kbd> 换行</span></div>
+                <button class="send-button" type="submit"><span>运行任务</span><i data-lucide="arrow-up-right"></i></button>
+              </div>
+            </form>
+          </div>
+
+          <aside class="trace-panel" aria-label="Agent 路由轨迹">
+            <div class="panel-heading"><div><span class="section-kicker">TRACE / 01</span><h3>路由轨迹</h3></div><button class="icon-button subtle" id="refresh-trace" aria-label="刷新轨迹" data-tooltip="刷新轨迹"><i data-lucide="refresh-cw"></i></button></div>
+            <div class="trace-status"><span class="pulse-ring"></span><span id="trace-state">等待下一次任务</span><span class="trace-clock" id="trace-clock">00:00</span></div>
+            <div class="trace-list" id="trace-list">
+              <div class="trace-item is-idle"><div class="trace-marker">01</div><div><strong>Query Rewrite</strong><span>等待输入</span></div><i data-lucide="minus"></i></div>
+              <div class="trace-item is-idle"><div class="trace-marker">02</div><div><strong>Intent Classifier</strong><span>等待输入</span></div><i data-lucide="minus"></i></div>
+              <div class="trace-item is-idle"><div class="trace-marker">03</div><div><strong>Task Planner</strong><span>等待输入</span></div><i data-lucide="minus"></i></div>
+              <div class="trace-item is-idle"><div class="trace-marker">04</div><div><strong>Vector Tool Router</strong><span>等待输入</span></div><i data-lucide="minus"></i></div>
+              <div class="trace-item is-idle"><div class="trace-marker">05</div><div><strong>Document Grader</strong><span>等待输入</span></div><i data-lucide="minus"></i></div>
+              <div class="trace-item is-idle"><div class="trace-marker">06</div><div><strong>Answer Grader</strong><span>等待输入</span></div><i data-lucide="minus"></i></div>
+            </div>
+            <div class="router-card"><div class="router-card-head"><span>TOOL MATCH</span><span class="similarity-badge" id="similarity-badge">—</span></div><strong id="matched-tool">等待向量匹配</strong><p id="matched-detail">任务开始后显示最相近的 Agent 能力。</p><div class="similarity-track"><span id="similarity-bar"></span></div></div>
+            <div class="trace-footer"><span>可观测节点</span><strong>06 / 06</strong></div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="view" id="library-view">
+        <div class="library-head"><div><span class="section-kicker">KNOWLEDGE BASE / 02</span><h2>资料库</h2><p>上传资料，观察它们从文件变成可检索证据。</p></div><button class="primary-button" id="upload-trigger"><i data-lucide="upload"></i>添加资料</button><input id="file-input" type="file" accept=".pdf,.docx,.txt,.md,.markdown" hidden /></div>
+        <div class="library-stats"><div><span>已接入资料</span><strong id="doc-count">0</strong></div><div><span>索引状态</span><strong id="index-status">等待连接</strong></div><div><span>检索策略</span><strong>Milvus + BM25</strong></div></div>
+        <div class="document-table-wrap"><table class="document-table"><thead><tr><th>文件</th><th>状态</th><th>加入时间</th><th>操作</th></tr></thead><tbody id="document-list"><tr class="empty-row"><td colspan="4"><i data-lucide="inbox"></i><strong>还没有资料</strong><span>上传 PDF、DOCX、TXT 或 Markdown，开始建立你的知识边界。</span></td></tr></tbody></table></div>
+      </section>
+
+      <section class="view" id="runs-view">
+        <div class="runs-head"><div><span class="section-kicker">RUN LOG / 03</span><h2>运行记录</h2><p>每次问答都留下清晰的路径和结果。</p></div><div class="run-filter"><span class="filter-dot"></span>最近 24 小时</div></div>
+        <div class="run-list" id="run-list"><div class="run-empty"><i data-lucide="list-tree"></i><strong>暂无运行记录</strong><span>完成一次问答后，这里会出现任务 DAG、工具匹配和评分结果。</span></div></div>
+      </section>
+    </main>
+  </div>
+  <div class="toast" id="toast" role="status"></div>
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

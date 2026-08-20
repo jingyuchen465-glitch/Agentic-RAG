@@ -1,0 +1,35 @@
+# ==================== 环境变量（含密钥） ====================
+.env
+.env.*
+!.env.example
+
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+*.sqlite3
+
+# ==================== 上传数据 ====================
+data/uploads/
+
+# ==================== IDE / 编辑器 ====================
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ==================== 前端 ====================
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ==================== 系统文件 ====================
+.DS_Store
+Thumbs.db

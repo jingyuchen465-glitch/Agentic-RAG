@@ -1,0 +1,1 @@
+"""Domain data contracts."""
