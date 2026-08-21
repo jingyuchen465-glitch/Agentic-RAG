@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import uuid
+import operator
 from collections.abc import AsyncIterator
-from typing import Any, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from app.core.config import get_settings
 from app.core.errors import AppError
-from app.domain.models import AgentType, ChatRequest, ChatResult, Citation, PlannedTask, TaskStatus
+from app.domain.models import AgentType, ChatRequest, ChatResult, Citation, PlannedTask
 from app.services.llm import OpenAILLMService
 from app.services.retrieval import ConfiguredHybridRetriever, HybridRetriever
 from app.services.tool_router import VectorToolRouter, default_tool_specs
@@ -24,7 +25,8 @@ class GraphState(TypedDict, total=False):
     intent: str
     tasks: list[dict[str, Any]]
     active_task_id: str | None
-    task_results: list[dict[str, Any]]
+    task_results: Annotated[list[dict[str, Any]], operator.add]
+    task_query: str
     citations: list[dict[str, Any]]
     max_relevance: float
     answer: str
@@ -32,6 +34,50 @@ class GraphState(TypedDict, total=False):
     retry_counts: dict[str, int]
     document_grade_reason: str
     answer_grade_reason: str
+
+
+class TaskState(TypedDict, total=False):
+    """单个任务的子流水线状态。每个任务一个独立实例，彼此不共享，并行执行。"""
+
+    session_id: str
+    original_query: str
+    standalone_query: str
+    retrieval_queries: list[str]
+    intent: str
+    tasks: list[dict[str, Any]]
+    active_task_id: str | None
+    task_results: Annotated[list[dict[str, Any]], operator.add]
+    task_query: str
+    citations: list[dict[str, Any]]
+    max_relevance: float
+    answer: str
+    warnings: list[str]
+    retry_counts: dict[str, int]
+    document_grade_reason: str
+    answer_grade_reason: str
+    document_grounded: bool
+    answer_approved: bool
+
+
+class TaskOut(TypedDict, total=False):
+    """并行任务子图允许向上层回写的通道。仅聚合字段可安全合并，
+    其余标量字段（session_id/answer/citations 等）一旦由多个并行实例各自回写
+    就会触发 LangGraph 的 InvalidUpdateError，故在此显式排除。"""
+
+    task_results: Annotated[list[dict[str, Any]], operator.add]
+
+
+_TRACE_LABELS = {
+    "rewrite": "Query Rewrite",
+    "schedule": "Task Scheduler",
+    "plan": "Task Planner",
+    "route": "Vector Tool Router",
+    "retrieve": "Document Retrieval",
+    "document_grade": "Document Grader",
+    "web_search": "Web Search",
+    "generate": "Answer Generation",
+    "answer_grade": "Answer Grader",
+}
 
 
 class AgenticWorkflow:
@@ -82,19 +128,55 @@ class AgenticWorkflow:
         tasks = await self.llm.plan(state["standalone_query"], state["intent"])
         return {"tasks": [task.model_dump(mode="json") for task in tasks], "task_results": [], "retry_counts": {}}
 
-    async def schedule(self, state: GraphState) -> GraphState:
-        """调度：选出第一个依赖已全部完成且仍处于 PENDING 的任务并置为 RUNNING。"""
-        completed = {item["task_id"] for item in state.get("task_results", [])}
-        for index, raw_task in enumerate(state["tasks"]):
-            task = PlannedTask.model_validate(raw_task)
-            if task.status == TaskStatus.PENDING and set(task.dependencies).issubset(completed):
-                raw_task["status"] = TaskStatus.RUNNING.value
-                return {"tasks": state["tasks"], "active_task_id": task.task_id}
-        return {"active_task_id": None}
+    def _ready_tasks(self, state: GraphState) -> list[dict[str, Any]]:
+        """返回依赖已全部完成且尚未执行的待调度任务（并行就绪集）。"""
+        done = {item["task_id"] for item in state.get("task_results", []) if item.get("task_id")}
+        return [
+            raw
+            for raw in state["tasks"]
+            if raw["task_id"] not in done and set(raw.get("dependencies", [])).issubset(done)
+        ]
 
-    def schedule_next(self, state: GraphState) -> str:
-        """调度后的分支：有待执行任务则路由，否则收尾。"""
-        return "route" if state.get("active_task_id") else "finalize"
+    def schedule(self, state: GraphState) -> GraphState:
+        """调度节点：仅统计待执行任务数供流式观测，真正的并行派发在 dispatch。"""
+        return {"pending": len(self._ready_tasks(state))}
+
+    def dispatch(self, state: GraphState) -> list[Any]:
+        """调度分发：把每个就绪任务作为独立 Send 并行派发；无任务则送收尾。"""
+        from langgraph.types import Send
+
+        ready = self._ready_tasks(state)
+        if not ready:
+            return [
+                Send(
+                    "finalize",
+                    {
+                        "session_id": state.get("session_id"),
+                        "standalone_query": state.get("standalone_query", ""),
+                        "task_results": state.get("task_results", []),
+                    },
+                )
+            ]
+        base_queries = state.get("retrieval_queries") or [state.get("standalone_query", "")]
+        # 每个 Send 分支彼此隔离，必须自带完整上下文（含任务身份与就绪状态快照）
+        return [
+            Send(
+                "execute_task",
+                {
+                    "session_id": state.get("session_id"),
+                    "original_query": state.get("original_query"),
+                    "standalone_query": state.get("standalone_query", ""),
+                    "retrieval_queries": base_queries,
+                    "intent": state.get("intent"),
+                    "tasks": state["tasks"],
+                    "active_task_id": task["task_id"],
+                    "task_query": task.get("goal") or base_queries[0],
+                    "warnings": [],
+                    "retry_counts": {},
+                },
+            )
+            for task in ready
+        ]
 
     async def route(self, state: GraphState) -> GraphState:
         """对当前任务做向量路由；无可用工具时记录警告并置空答案。"""
@@ -102,8 +184,12 @@ class AgenticWorkflow:
         task = self._current_task(state)
         decision = await self.router.route(task)
         if not decision.selected_tool_id:
-            return {"warnings": state.get("warnings", []) + [f"{task.task_id}: {decision.reason}"], "answer": ""}
-        return {"task_results": state.get("task_results", []) + [{"routing": decision.model_dump()}]}
+            out: dict[str, Any] = {"warnings": state.get("warnings", []) + [f"{task.task_id}: {decision.reason}"], "answer": ""}
+            self._emit_stream("route", out)
+            return out
+        out = {"task_results": [{"routing": decision.model_dump()}]}
+        self._emit_stream("route", out)
+        return out
 
     def routed_branch(self, state: GraphState) -> str:
         """路由结果分支：未选出工具时兜底走 RAG 检索，选中显式不支持的工具才标记失败。"""
@@ -116,12 +202,14 @@ class AgenticWorkflow:
         return "retrieve"
 
     async def retrieve(self, state: GraphState) -> GraphState:
-        """混合检索：取第一条检索子查询，返回知识库引用及最高相关度。"""
-        query = state["retrieval_queries"][0]
+        """混合检索：基于任务自身查询返回知识库引用及最高相关度。"""
+        query = state.get("task_query") or (state.get("retrieval_queries") or [""])[0]
         chunks = await self.retriever.retrieve(query, get_settings().retrieval_top_k)
         citations = [chunk.citation.model_dump(mode="json") for chunk in chunks]
         max_relevance = max((float(c.relevance) for c in chunks if c.relevance is not None), default=0.0)
-        return {"citations": citations, "max_relevance": max_relevance}
+        out = {"citations": citations, "max_relevance": max_relevance}
+        self._emit_stream("retrieve", out)
+        return out
 
     def documents_grounded(self, state: GraphState) -> bool:
         """确定性判定：检索到的最高相关度达到阈值即视为证据充分，避免依赖不稳的模型布尔。"""
@@ -140,29 +228,42 @@ class AgenticWorkflow:
         )
         warning = "Knowledge-base evidence was insufficient."
         warnings = state.get("warnings", []) if grounded else state.get("warnings", []) + [warning]
-        return {"document_grade_reason": reason, "document_grounded": grounded, "warnings": warnings}
+        out = {"document_grade_reason": reason, "document_grounded": grounded, "warnings": warnings}
+        self._emit_stream("document_grade", out)
+        return out
 
     def document_branch(self, state: GraphState) -> str:
         """文档评分分支：证据充分则生成回答，否则转网络搜索。"""
         return "generate" if not state.get("warnings", []) or "Knowledge-base evidence was insufficient." not in state["warnings"] else "web_search"
 
     async def web_search_node(self, state: GraphState) -> GraphState:
-        """网络搜索节点：把搜索结果并入引用列表。"""
-        results = await self.web_search.search(state["standalone_query"])
+        """网络搜索节点：基于任务自身查询把搜索结果并入引用列表。"""
+        query = state.get("task_query") or state.get("standalone_query", "")
+        results = await self.web_search.search(query)
         citations = state.get("citations", []) + [result.model_dump(mode="json") for result in results]
-        return {"citations": citations}
+        out = {"citations": citations}
+        self._emit_stream("web_search", out)
+        return out
 
     async def generate(self, state: GraphState) -> GraphState:
-        """基于引用生成最终回答。"""
-        return {"answer": await self.llm.generate(state["standalone_query"], state.get("citations", []))}
+        """基于引用生成当前任务的回答。"""
+        query = state.get("task_query") or state.get("standalone_query", "")
+        answer = await self.llm.generate(query, state.get("citations", []))
+        out = {"answer": answer}
+        self._emit_stream("generate", out)
+        return out
 
     async def answer_grade(self, state: GraphState) -> GraphState:
         """回答评分：未通过则累计该任务的重试次数并追加警告。"""
-        approved, reason = await self.llm.grade_answer(state["standalone_query"], state["answer"], state.get("citations", []))
+        query = state.get("task_query") or state.get("standalone_query", "")
+        approved, reason = await self.llm.grade_answer(query, state["answer"], state.get("citations", []))
         task = self._current_task(state)
         retries = dict(state.get("retry_counts", {}))
         retries[task.task_id] = retries.get(task.task_id, 0) + (0 if approved else 1)
-        return {"answer_grade_reason": reason, "answer_approved": approved, "retry_counts": retries, "warnings": state.get("warnings", []) if approved else state.get("warnings", []) + [f"Answer requires revision: {reason}"]}
+        warnings = state.get("warnings", []) if approved else state.get("warnings", []) + [f"Answer requires revision: {reason}"]
+        out = {"answer_grade_reason": reason, "answer_approved": approved, "retry_counts": retries, "warnings": warnings}
+        self._emit_stream("answer_grade", out)
+        return out
 
     def answer_branch(self, state: GraphState) -> str:
         """回答评分分支：重试未超限则重新检索，否则完成当前任务。"""
@@ -173,68 +274,86 @@ class AgenticWorkflow:
         return "complete_task"
 
     async def complete_task(self, state: GraphState) -> GraphState:
-        """将当前任务标记为完成，并把答案写入任务结果。"""
+        """将当前任务的答案/引用/警告作为一条增量写入任务结果，供收尾汇总。"""
         task = self._current_task(state)
-        for raw_task in state["tasks"]:
-            if raw_task["task_id"] == task.task_id:
-                raw_task["status"] = TaskStatus.COMPLETED.value
-        results = [entry for entry in state.get("task_results", []) if "routing" not in entry]
-        results.append({"task_id": task.task_id, "status": "completed", "answer": state.get("answer", "")})
-        return {"tasks": state["tasks"], "task_results": results, "active_task_id": None}
+        return {
+            "task_results": [
+                {
+                    "task_id": task.task_id,
+                    "status": "completed",
+                    "answer": state.get("answer", ""),
+                    "citations": state.get("citations", []),
+                    "warnings": state.get("warnings", []),
+                }
+            ]
+        }
 
     async def complete_unsupported(self, state: GraphState) -> GraphState:
-        """当前任务选中的工具当前不可用：标记失败并给出可读的说明。"""
+        """当前任务选中的工具不可用：将失败结果作为增量写入任务结果。"""
         task = self._current_task(state)
-        for raw_task in state["tasks"]:
-            if raw_task["task_id"] == task.task_id:
-                raw_task["status"] = TaskStatus.FAILED.value
         routing = next((entry.get("routing") for entry in reversed(state.get("task_results", [])) if "routing" in entry), None)
         reason = routing.get("reason", "") if routing else ""
         answer = f"当前查询对应的能力暂未开通，无法回答。{reason}" if reason else "当前查询对应的能力暂未开通，无法回答。"
-        results = [entry for entry in state.get("task_results", []) if "routing" not in entry]
-        results.append({"task_id": task.task_id, "status": "failed", "answer": answer})
-        return {"tasks": state["tasks"], "task_results": results, "active_task_id": None}
+        return {"task_results": [{"task_id": task.task_id, "status": "failed", "answer": answer}]}
 
     async def finalize(self, state: GraphState) -> GraphState:
-        """收尾：汇总各任务答案；无答案时给出兜底文案。"""
-        answers = [item["answer"] for item in state.get("task_results", []) if item.get("answer")]
-        return {"answer": "\n\n".join(answers) or state.get("answer", "Unable to produce an answer.")}
+        """收尾：汇总各任务答案、引用与警告；无答案时给出兜底文案。"""
+        results = state.get("task_results", [])
+        answers = [item["answer"] for item in results if item.get("answer")]
+        citations = [c for item in results for c in item.get("citations", [])]
+        warnings = [w for item in results for w in item.get("warnings", [])]
+        # 不回写 task_results：该字段是 operator.add reducer，回写会把聚合结果再次追加成双份
+        return {
+            "answer": "\n\n".join(answers) or state.get("answer", "Unable to produce an answer."),
+            "citations": citations or state.get("citations", []),
+            "warnings": warnings or state.get("warnings", []),
+        }
 
     def _build_graph(self):
-        """构建并编译 LangGraph 状态图，定义节点与流转边。"""
+        """构建并编译 LangGraph：外层做改写/规划/并行调度，内层子图为单任务流水线。"""
         try:
             from langgraph.graph import END, START, StateGraph
         except ImportError as exc:
             raise AppError("DEPENDENCY_MISSING", "安装langgraph以运行工作流。", 503) from exc
-        graph = StateGraph(GraphState)
-        graph.add_node("rewrite", self.rewrite)
-        graph.add_node("plan", self.plan)
-        graph.add_node("schedule", self.schedule)
-        graph.add_node("route", self.route)
-        graph.add_node("retrieve", self.retrieve)
-        graph.add_node("document_grade", self.document_grade)
-        graph.add_node("web_search", self.web_search_node)
-        graph.add_node("generate", self.generate)
-        graph.add_node("answer_grade", self.answer_grade)
-        graph.add_node("complete_task", self.complete_task)
-        graph.add_node("complete_unsupported", self.complete_unsupported)
-        graph.add_node("finalize", self.finalize)
-        graph.add_edge(START, "rewrite")
-        graph.add_edge("rewrite", "plan")
-        graph.add_edge("plan", "schedule")
-        graph.add_conditional_edges("schedule", self.schedule_next, {"route": "route", "finalize": "finalize"})
-        graph.add_conditional_edges(
+
+        # 内层：单个任务的路由→检索/搜索→评分→生成→完成，每个任务一个独立实例并行运行
+        # output_schema 把子图回写限制为 task_results，避免并行实例回写标量字段互相冲突
+        task_graph = StateGraph(TaskState, output_schema=TaskOut)
+        task_graph.add_node("route", self.route)
+        task_graph.add_node("retrieve", self.retrieve)
+        task_graph.add_node("document_grade", self.document_grade)
+        task_graph.add_node("web_search", self.web_search_node)
+        task_graph.add_node("generate", self.generate)
+        task_graph.add_node("answer_grade", self.answer_grade)
+        task_graph.add_node("complete_task", self.complete_task)
+        task_graph.add_node("complete_unsupported", self.complete_unsupported)
+        task_graph.add_edge(START, "route")
+        task_graph.add_conditional_edges(
             "route",
             self.routed_branch,
             {"retrieve": "retrieve", "web_search": "web_search", "complete_unsupported": "complete_unsupported"},
         )
-        graph.add_edge("retrieve", "document_grade")
-        graph.add_conditional_edges("document_grade", self.document_branch, {"generate": "generate", "web_search": "web_search"})
-        graph.add_edge("web_search", "generate")
-        graph.add_edge("generate", "answer_grade")
-        graph.add_conditional_edges("answer_grade", self.answer_branch, {"retrieve": "retrieve", "complete_task": "complete_task"})
-        graph.add_edge("complete_task", "schedule")
-        graph.add_edge("complete_unsupported", "schedule")
+        task_graph.add_edge("retrieve", "document_grade")
+        task_graph.add_conditional_edges("document_grade", self.document_branch, {"generate": "generate", "web_search": "web_search"})
+        task_graph.add_edge("web_search", "generate")
+        task_graph.add_edge("generate", "answer_grade")
+        task_graph.add_conditional_edges("answer_grade", self.answer_branch, {"retrieve": "retrieve", "complete_task": "complete_task"})
+        task_graph.add_edge("complete_task", END)
+        task_graph.add_edge("complete_unsupported", END)
+        task_subgraph = task_graph.compile()
+
+        # 外层：改写→规划→并行调度→收尾；execute_task 即上文编译好的任务子图
+        graph = StateGraph(GraphState)
+        graph.add_node("rewrite", self.rewrite)
+        graph.add_node("plan", self.plan)
+        graph.add_node("schedule", self.schedule)
+        graph.add_node("execute_task", task_subgraph)
+        graph.add_node("finalize", self.finalize)
+        graph.add_edge(START, "rewrite")
+        graph.add_edge("rewrite", "plan")
+        graph.add_edge("plan", "schedule")
+        graph.add_conditional_edges("schedule", self.dispatch, ["execute_task", "finalize"])
+        graph.add_edge("execute_task", "schedule")
         graph.add_edge("finalize", END)
         return graph.compile()
 
@@ -263,10 +382,26 @@ class AgenticWorkflow:
         yield {"event": "metadata", "data": {"session_id": session_id}}
         seed = {"session_id": session_id, "original_query": request.query, "warnings": [], "citations": []}
         state: dict[str, Any] = dict(seed)
-        # stream_mode="updates"：每完成一个节点就吐一次该节点的增量状态，用于逐节点观测
-        async for update in self._graph.astream(seed, stream_mode="updates"):
-            for node_name, partial in update.items() or []:
+        # subgraphs=True 把各并行任务子图内的节点事件也上抛；finalize 节点会聚合所有任务结果纠正最终状态
+        # 组合 stream_mode + subgraphs 时每个事件为 (namespace, mode, value) 三元组：
+        #   - updates 只用于根层状态增量（rewrite/plan/finalize 等），子图内 updates 因 output_schema 裁剪多为 None，跳过
+        #   - custom 由子图内任务节点（route/retrieve/grade/generate 等）主动上抛，作为 trace 展示
+        async for namespace, mode, value in self._graph.astream(seed, stream_mode=["updates", "custom"], subgraphs=True):
+            if mode == "custom":
+                yield {"event": "trace", "data": {k: value[k] for k in ("node", "label", "output", "tool", "score") if k in value}}
+                continue
+            if namespace:  # 子图内的 updates 已改由 custom 上抛，跳过避免重复
+                continue
+            for node_name, partial in (value or {}).items():
+                # 根层控制事件可能携带非字典增量（None），跳过以免崩溃
+                if not isinstance(partial, dict):
+                    continue
+                # task_results 是 operator.add reducer；流式增量需逐个追加，而不是覆盖，否则会丢失并行任务结果
+                extra_results = partial.pop("task_results", None) if isinstance(partial.get("task_results"), list) else None
                 state.update(partial)
+                if extra_results is not None:
+                    state.setdefault("task_results", [])
+                    state["task_results"].extend(extra_results)
                 event = self._trace_event(node_name, partial)
                 if event:
                     yield event
@@ -288,18 +423,7 @@ class AgenticWorkflow:
 
     def _trace_event(self, node_name: str, partial: dict[str, Any]) -> dict[str, Any] | None:
         """把单个节点的增量状态转成可观测的 trace 事件；无需展示的节点返回 None。"""
-        labels = {
-            "rewrite": "Query Rewrite",
-            "schedule": "Task Scheduler",
-            "plan": "Task Planner",
-            "route": "Vector Tool Router",
-            "retrieve": "Document Retrieval",
-            "document_grade": "Document Grader",
-            "web_search": "Web Search",
-            "generate": "Answer Generation",
-            "answer_grade": "Answer Grader",
-        }
-        label = labels.get(node_name)
+        label = _TRACE_LABELS.get(node_name)
         if not label:
             return None
         data: dict[str, Any] = {"node": node_name, "label": label, "output": self._node_output(node_name, partial)}
@@ -311,13 +435,33 @@ class AgenticWorkflow:
         return {"event": "trace", "data": data}
 
     @staticmethod
+    def _emit_stream(node_name: str, partial: dict[str, Any]) -> None:
+        """任务子图内节点主动上抛可观测 trace（output_schema 会裁剪 updates 通道，
+        因此子图内节点改用 custom streaming 事件，确保检索/评分/生成仍能被观测）。"""
+        label = _TRACE_LABELS.get(node_name)
+        if not label:
+            return
+        try:
+            from langgraph.config import get_stream_writer
+            writer = get_stream_writer()
+        except Exception:
+            return
+        data: dict[str, Any] = {"type": "trace", "node": node_name, "label": label, "output": AgenticWorkflow._node_output(node_name, partial)}
+        if node_name == "route":
+            routing = next((entry.get("routing") for entry in partial.get("task_results", []) if "routing" in entry), None)
+            if routing:
+                data["tool"] = routing.get("selected_tool_id")
+                data["score"] = routing.get("score")
+        writer(data)
+
+    @staticmethod
     def _node_output(node_name: str, partial: dict[str, Any]) -> str:
         """根据节点类型把增量状态格式化成人类可读的输出文本。"""
         if node_name == "rewrite":
             queries = partial.get("retrieval_queries") or [partial.get("standalone_query", "")]
             return f"独立问句：{partial.get('standalone_query', '')}\n检索子查询：{', '.join(queries)}\n意图：{partial.get('intent', '')}"
         if node_name == "schedule":
-            return f"当前任务：{partial.get('active_task_id') or '（无，进入收尾）'}"
+            return f"待执行任务：{partial.get('pending', 0)}"
         if node_name == "plan":
             tasks = [
                 f"- {task.get('task_id')} | {task.get('goal')} | agent_type={task.get('agent_type')}"
