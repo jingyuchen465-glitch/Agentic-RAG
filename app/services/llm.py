@@ -74,15 +74,6 @@ class OpenAILLMService:
             raise AppError("PLAN_EMPTY", "Task Planner returned no executable tasks.", 502)
         return tasks
 
-    async def grade_documents(self, query: str, context: str) -> tuple[bool, str]:
-        """文档评分：判断检索到的证据是否相关且足以回答问题。"""
-        result = await self._json(
-            "Decide whether the supplied evidence is relevant and sufficient to answer the question. "
-            "Return JSON only: {\"grounded\": boolean, \"reason\": string}.\n"
-            f"Question: {query}\nEvidence:\n{context}"
-        )
-        return bool(result.get("grounded")), str(result.get("reason", ""))
-
     async def generate(self, query: str, citations: list[dict[str, Any]]) -> str:
         """基于引用证据生成回答，要求按 [1]、[2] 内联标注来源。"""
         evidence = "\n\n".join(f"[{idx + 1}] {item['content']}" for idx, item in enumerate(citations))
@@ -112,9 +103,6 @@ class FakeLLMService:
 
     async def plan(self, query: str, intent: str) -> list[PlannedTask]:
         return [PlannedTask(task_id="task-1", goal=query, agent_type="rag")]
-
-    async def grade_documents(self, query: str, context: str) -> tuple[bool, str]:
-        return bool(context), "fake document grade"
 
     async def generate(self, query: str, citations: list[dict[str, Any]]) -> str:
         return citations[0]["content"] if citations else "No evidence found."

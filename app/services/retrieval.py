@@ -11,10 +11,11 @@ from app.services.repository import MySQLKnowledgeRepository
 
 @dataclass(slots=True)
 class RetrievedChunk:
-    """检索结果：一条引用信息及其融合后的得分。"""
+    """检索结果：一条引用信息、融合后的得分，以及稠密余弦相关度（0~1，可空）。"""
 
     citation: Citation
     score: float
+    relevance: float | None = None
 
 
 class HybridRetriever:
@@ -109,6 +110,7 @@ class ConfiguredHybridRetriever(HybridRetriever):
                             content=entity.get("content", ""),
                         ),
                         score=float(hit.distance),
+                        relevance=float(hit.distance),
                     )
                 )
         sparse = self._sparse_search(query, top_k)
@@ -118,8 +120,15 @@ class ConfiguredHybridRetriever(HybridRetriever):
             key = item.citation.chunk_id or item.citation.content[:80]
             fused_score = 1.0 / (60 + rank)
             previous = fused.get(key)
-            fused[key] = (fused_score + (previous[0] if previous else 0.0), item)
-        return [item for _, item in sorted(fused.values(), key=lambda pair: pair[0], reverse=True)[:top_k]]
+            if previous is None:
+                fused[key] = (fused_score, item)
+                continue
+            prev_score, prev_item = previous
+            # 同一分块在稠密/稀疏中可能都出现：保留带稠密相关度版本供判定使用
+            keep = prev_item if prev_item.relevance is not None or item.relevance is None else item
+            fused[key] = (fused_score + prev_score, keep)
+        ranked = sorted(fused.values(), key=lambda pair: pair[0], reverse=True)[:top_k]
+        return [RetrievedChunk(citation=item.citation, score=score, relevance=item.relevance) for score, item in ranked]
 
 
 class FakeHybridRetriever(HybridRetriever):

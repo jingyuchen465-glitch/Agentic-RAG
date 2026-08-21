@@ -31,6 +31,7 @@ class Settings:
     retrieval_top_k: int
     router_threshold: float
     router_ambiguity_delta: float
+    retrieval_grounded_threshold: float
     max_agent_retries: int
     session_ttl_seconds: int
 
@@ -76,6 +77,7 @@ def get_settings() -> Settings:
         retrieval_top_k=int(os.getenv("RETRIEVAL_TOP_K", "8")),
         router_threshold=float(os.getenv("ROUTER_THRESHOLD", "0.62")),
         router_ambiguity_delta=float(os.getenv("ROUTER_AMBIGUITY_DELTA", "0.05")),
+        retrieval_grounded_threshold=float(os.getenv("RETRIEVAL_GROUNDED_THRESHOLD", "0.35")),
         max_agent_retries=int(os.getenv("MAX_AGENT_RETRIES", "2")),
         session_ttl_seconds=int(os.getenv("SESSION_TTL_SECONDS", "3600")),
     )

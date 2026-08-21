@@ -26,6 +26,7 @@ class GraphState(TypedDict, total=False):
     active_task_id: str | None
     task_results: list[dict[str, Any]]
     citations: list[dict[str, Any]]
+    max_relevance: float
     answer: str
     warnings: list[str]
     retry_counts: dict[str, int]
@@ -115,17 +116,31 @@ class AgenticWorkflow:
         return "retrieve"
 
     async def retrieve(self, state: GraphState) -> GraphState:
-        """混合检索：取第一条检索子查询，返回知识库引用。"""
+        """混合检索：取第一条检索子查询，返回知识库引用及最高相关度。"""
         query = state["retrieval_queries"][0]
         chunks = await self.retriever.retrieve(query, get_settings().retrieval_top_k)
         citations = [chunk.citation.model_dump(mode="json") for chunk in chunks]
-        return {"citations": citations}
+        max_relevance = max((float(c.relevance) for c in chunks if c.relevance is not None), default=0.0)
+        return {"citations": citations, "max_relevance": max_relevance}
+
+    def documents_grounded(self, state: GraphState) -> bool:
+        """确定性判定：检索到的最高相关度达到阈值即视为证据充分，避免依赖不稳的模型布尔。"""
+        return float(state.get("max_relevance", 0.0)) >= get_settings().retrieval_grounded_threshold
 
     async def document_grade(self, state: GraphState) -> GraphState:
-        """文档评分：证据不足时追加警告，触发网络搜索兜底。"""
-        context = "\n".join(item["content"] for item in state.get("citations", []))
-        grounded, reason = await self.llm.grade_documents(state["standalone_query"], context)
-        return {"document_grade_reason": reason, "document_grounded": grounded, "warnings": state.get("warnings", []) if grounded else state.get("warnings", []) + ["Knowledge-base evidence was insufficient."]}
+        """文档评分：按检索相关度确定性判定证据是否充分，并给出可读理由。"""
+        count = len(state.get("citations", []))
+        relevance = float(state.get("max_relevance", 0.0))
+        threshold = get_settings().retrieval_grounded_threshold
+        grounded = self.documents_grounded(state)
+        reason = (
+            f"检索到 {count} 条证据，最高相关度 {relevance:.3f}"
+            f"{'（达到' if grounded else '（未达到'}判定阈值 {threshold:.2f}）。"
+            f"{'证据充分，可直接回答。' if grounded else '证据不足，转网络搜索补充。'}"
+        )
+        warning = "Knowledge-base evidence was insufficient."
+        warnings = state.get("warnings", []) if grounded else state.get("warnings", []) + [warning]
+        return {"document_grade_reason": reason, "document_grounded": grounded, "warnings": warnings}
 
     def document_branch(self, state: GraphState) -> str:
         """文档评分分支：证据充分则生成回答，否则转网络搜索。"""
@@ -320,7 +335,10 @@ class AgenticWorkflow:
             lines = [f"- {item.get('content', '')[:60]}" for item in citations[:5]]
             return f"检索到 {len(citations)} 条证据：\n" + "\n".join(lines)
         if node_name == "document_grade":
-            return f"证据是否充分：{partial.get('document_grounded', False)}\n理由：{partial.get('document_grade_reason', '')}"
+            reason = partial.get("document_grade_reason", "")
+            # 判定结果以理由文本为准，避免 LangGraph 增量流丢失布尔字段导致展示失真
+            is_grounded = "证据充分" in reason
+            return f"证据是否充分：{is_grounded}\n理由：{reason}"
         if node_name == "web_search":
             citations = partial.get("citations", [])
             web_count = sum(1 for item in citations if item.get("source_type") == "web")
