@@ -8,24 +8,33 @@ from app.core.errors import AppError
 from app.domain.models import PlannedTask
 
 
+def _get_chat_client() -> Any:
+    """模块级单例：复用 ChatOpenAI 客户端，避免每次调用都重新实例化。"""
+    settings = get_settings()
+    if not settings.openai_api_key:
+        raise AppError("MODEL_NOT_CONFIGURED", "OPENAI_API_KEY is required.", 503)
+    try:
+        from langchain_openai import ChatOpenAI
+    except ImportError as exc:
+        raise AppError("DEPENDENCY_MISSING", "Install langchain-openai to use the model.", 503) from exc
+    return ChatOpenAI(
+        model=settings.chat_model,
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url,
+        temperature=0,
+    )
+
+
 class OpenAILLMService:
     """基于 OpenAI Chat 模型的大模型服务：改写、意图识别、规划、评分与生成。"""
 
-    def _model(self):
-        """懒加载 ChatOpenAI 客户端；未配置 API Key 或缺少依赖时抛 503。"""
-        settings = get_settings()
-        if not settings.openai_api_key:
-            raise AppError("MODEL_NOT_CONFIGURED", "OPENAI_API_KEY is required.", 503)
-        try:
-            from langchain_openai import ChatOpenAI
-        except ImportError as exc:
-            raise AppError("DEPENDENCY_MISSING", "Install langchain-openai to use the model.", 503) from exc
-        return ChatOpenAI(
-            model=settings.chat_model,
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url,
-            temperature=0,
-        )
+    def __init__(self):
+        self._client = None
+
+    def _model(self) -> Any:
+        if self._client is None:
+            self._client = _get_chat_client()
+        return self._client
 
     async def _json(self, prompt: str) -> dict[str, Any]:
         """调用模型并强制解析为 JSON 对象，解析失败时抛 502。"""
@@ -60,18 +69,33 @@ class OpenAILLMService:
             "intent": str(result.get("intent", "knowledge_lookup")),
         }
 
+    # 单一知识问答强制单任务，防止规划器把同一条问题拆成多个内容重叠、重复检索的子任务。
     async def plan(self, query: str, intent: str) -> list[PlannedTask]:
-        """根据意图生成最小任务 DAG；无任务时抛 502。"""
+        """根据意图生成最小任务 DAG；知识问答强制单任务；无任务时抛 502。"""
         result = await self._json(
             "Create a minimal task DAG for an Agentic RAG workflow. Return JSON only: "
             "{\"tasks\":[{\"task_id\":string,\"goal\":string,\"dependencies\":[string],"
             "\"required_inputs\":[string],\"constraints\":[string],\"agent_type\":\"rag\"|\"tools\"|\"fallback\"}]}. "
-            "Use rag for knowledge questions. Do not create a database task unless the query explicitly asks for data analysis.\n"
+            "Rules:\n"
+            "- If the intent is \"knowledge_lookup\" (a single knowledge question), return EXACTLY ONE `rag` task "
+            "whose goal is the full user question; never split a knowledge question into multiple redundant sub-tasks.\n"
+            "- Split into multiple tasks ONLY for \"multi_step\" queries whose sub-questions are genuinely "
+            "independent and can be answered by different retrievals; avoid overlapping duplicate answers.\n"
+            "- Use `rag` for knowledge questions. Do not create a database task unless the query explicitly asks for data analysis.\n"
             f"Intent: {intent}\nQuery: {query}"
         )
         tasks = [PlannedTask.model_validate(item) for item in result.get("tasks", [])]
         if not tasks:
             raise AppError("PLAN_EMPTY", "Task Planner returned no executable tasks.", 502)
+        return self._enforce_plan_shape(query, intent, tasks)
+
+    @staticmethod
+    def _enforce_plan_shape(
+        query: str, intent: str, tasks: list[PlannedTask]
+    ) -> list[PlannedTask]:
+        """确定性兜底：知识问答无论模型输出什么，都收敛为单个 RAG 任务。"""
+        if intent == "knowledge_lookup" and len(tasks) != 1:
+            return [PlannedTask(task_id="task_rag", goal=query, required_inputs=["query"], agent_type="rag")]
         return tasks
 
     async def generate(self, query: str, citations: list[dict[str, Any]]) -> str:

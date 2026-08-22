@@ -7,7 +7,7 @@ from fastapi import UploadFile
 
 from app.core.config import get_settings
 from app.core.errors import AppError
-from app.services.repository import MySQLKnowledgeRepository
+from app.services.repository import KnowledgeRepository
 from app.services.ingestion import DocumentIngestor
 
 
@@ -15,7 +15,7 @@ class KnowledgeService:
     """知识库服务：文件上传、列表、删除、重新索引与任务状态查询。"""
 
     def __init__(self, repository=None):
-        self.repository = repository or MySQLKnowledgeRepository(get_settings().database_url)
+        self.repository = repository or KnowledgeRepository(get_settings().database_url)
 
     async def upload(self, file: UploadFile) -> dict[str, str]:
         """校验文件类型与大小，落盘并登记文档与索引任务，返回两者的 ID。"""

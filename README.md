@@ -86,7 +86,7 @@ route → retrieve → document_grade → generate → answer_grade → complete
 | Web 框架 | FastAPI, Uvicorn, pydantic v2 |
 | 工作流编排 | LangGraph |
 | 模型调用 | LangChain, langchain-openai（OpenAI Chat / Embedding） |
-| 文档解析 | llama-index-core, llama-index-readers-file（SentenceSplitter 切分） |
+| 文档解析 | LlamaIndex（递归切分）、PyMuPDF、PaddleOCR/PP-Structure、OSS |
 | 稠密检索 | PyMilvus(≥2.5), Milvus |
 | 稀疏检索 | rank-bm25 (BM25Okapi) + MySQL |
 | 缓存/会话 | Redis |
@@ -239,7 +239,13 @@ SESSION_TTL_SECONDS=3600
 - **Milvus（稠密向量）**，collection `knowledge_chunks`，schema 字段：`id` / `vector`(COSINE) / `document_id` / `chunk_id` / `document_name` / `content` / `page`
 - **Redis（会话）**：key 前缀 `agentic-rag:session:`，带 TTL
 
-文件上传后在后台任务中：LlamaIndex 解析文件 → `SentenceSplitter` 切分（chunk_size=800，overlap=120）→ 向量化 → 写入 Milvus 并替换 MySQL 分块。
+文件上传后在后台任务中：
+
+- PDF 先由 PyMuPDF 按页提取文本并判断是否为扫描页；扫描页走 PaddleOCR。
+- 对需要版面识别的页面使用 PP-Structure 区分文本、图片和表格，三类区域受并发上限控制并按原阅读顺序组装。
+- 图片由视觉模型生成描述并上传 OSS，正文保存为 Markdown 图片链接；表格转换为可检索文本。
+- 组装结果使用 LlamaIndex 递归切分（章节、段落、换行、句号等），超长块再执行固定长度兜底，然后向量化写入 Milvus 并替换 MySQL 分块。
+- 纯文本 PDF 不会强制加载 PaddleOCR；只有实际遇到扫描页、图片或表格区域时才要求对应服务配置。
 
 ## 测试
 
