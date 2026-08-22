@@ -26,6 +26,12 @@ class Settings:
     openai_base_url: str | None
     chat_model: str
     embedding_model: str
+    vision_model: str
+    oss_access_key_id: str | None
+    oss_access_key_secret: str | None
+    oss_bucket: str | None
+    oss_endpoint: str | None
+    oss_public_base_url: str | None
     tavily_api_key: str | None
     max_upload_size_mb: int
     retrieval_top_k: int
@@ -34,6 +40,12 @@ class Settings:
     retrieval_grounded_threshold: float
     max_agent_retries: int
     session_ttl_seconds: int
+    chunk_size: int
+    chunk_overlap: int
+    max_chunk_size: int
+    pdf_ocr_language: str
+    pdf_render_dpi: int
+    pdf_concurrency: int
 
     def missing_runtime_settings(self) -> list[str]:
         """返回尚未配置的外部服务环境变量名，用于健康检查与启动校验。"""
@@ -72,6 +84,12 @@ def get_settings() -> Settings:
         openai_base_url=_optional("OPENAI_BASE_URL"),
         chat_model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini"),
         embedding_model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
+        vision_model=os.getenv("VISION_MODEL", "qwen-vl-plus"),
+        oss_access_key_id=_optional("OSS_ACCESS_KEY_ID"),
+        oss_access_key_secret=_optional("OSS_ACCESS_KEY_SECRET"),
+        oss_bucket=_optional("OSS_BUCKET"),
+        oss_endpoint=_optional("OSS_ENDPOINT"),
+        oss_public_base_url=_optional("OSS_PUBLIC_BASE_URL"),
         tavily_api_key=_optional("TAVILY_API_KEY"),
         max_upload_size_mb=int(os.getenv("MAX_UPLOAD_SIZE_MB", "20")),
         retrieval_top_k=int(os.getenv("RETRIEVAL_TOP_K", "8")),
@@ -80,4 +98,10 @@ def get_settings() -> Settings:
         retrieval_grounded_threshold=float(os.getenv("RETRIEVAL_GROUNDED_THRESHOLD", "0.35")),
         max_agent_retries=int(os.getenv("MAX_AGENT_RETRIES", "2")),
         session_ttl_seconds=int(os.getenv("SESSION_TTL_SECONDS", "3600")),
+        chunk_size=int(os.getenv("CHUNK_SIZE", "800")),
+        chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "120")),
+        max_chunk_size=int(os.getenv("MAX_CHUNK_SIZE", "2000")),
+        pdf_ocr_language=os.getenv("PDF_OCR_LANGUAGE", "ch"),
+        pdf_render_dpi=int(os.getenv("PDF_RENDER_DPI", "144")),
+        pdf_concurrency=max(1, int(os.getenv("PDF_CONCURRENCY", "4"))),
     )
