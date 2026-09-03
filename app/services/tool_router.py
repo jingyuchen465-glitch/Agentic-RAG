@@ -117,3 +117,38 @@ def default_tool_specs() -> list[ToolSpec]:
             agent_type=AgentType.TOOLS,
         ),
     ]
+
+
+def mcp_tool_specs(tools: list[dict]) -> tuple[list[ToolSpec], dict[str, dict]]:
+    """把 MCP 中台 tools/list 返回的工具转换为路由可用的 ToolSpec。
+
+    每个 MCP 动态工具映射为一个 ``mcp:{name}`` 的工具 ID，agent_type 固定为
+    TOOLS，供向量路由与 rag-agent/web-search-agent 一起参与语义匹配。同时返回
+    tool_id -> inputSchema 的映射，供执行节点按 schema 绑定调用参数。由于任务
+    required_inputs 默认为 ``query``，这里统一将其声明为 ``query`` 以通过硬过滤，
+    真正的入参在 tools/call 阶段再按 schema 解析。
+    """
+    from app.domain.models import AgentType
+
+    specs: list[ToolSpec] = []
+    schemas: dict[str, dict] = {}
+    for tool in tools:
+        name = tool.get("name")
+        if not name:
+            continue
+        schema = tool.get("inputSchema") or {}
+        tool_id = f"mcp:{name}"
+        specs.append(
+            ToolSpec(
+                tool_id=tool_id,
+                name=name,
+                description=tool.get("description", "") or name,
+                capabilities=["external api", name],
+                required_inputs=["query"],
+                constraints=[],
+                enabled=True,
+                agent_type=AgentType.TOOLS,
+            )
+        )
+        schemas[tool_id] = schema
+    return specs, schemas

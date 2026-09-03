@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 import operator
 from collections.abc import AsyncIterator
@@ -7,10 +8,11 @@ from typing import Annotated, Any, TypedDict
 
 from app.core.config import get_settings
 from app.core.errors import AppError
-from app.domain.models import AgentType, ChatRequest, ChatResult, Citation, PlannedTask
+from app.domain.models import AgentType, ChatRequest, ChatResult, Citation, PlannedTask, ToolSpec
 from app.services.llm import OpenAILLMService
+from app.services.mcp_client import McpClient, bind_arguments
 from app.services.retrieval import ConfiguredHybridRetriever, HybridRetriever
-from app.services.tool_router import VectorToolRouter, default_tool_specs
+from app.services.tool_router import VectorToolRouter, default_tool_specs, mcp_tool_specs
 from app.services.web_search import TavilySearch
 from app.services.session import RedisSessionStore
 
@@ -75,6 +77,7 @@ _TRACE_LABELS = {
     "retrieve": "Document Retrieval",
     "document_grade": "Document Grader",
     "web_search": "Web Search",
+    "mcp_call": "MCP Tool Call",
     "generate": "Answer Generation",
     "answer_grade": "Answer Grader",
 }
@@ -90,6 +93,7 @@ class AgenticWorkflow:
         router: VectorToolRouter | None = None,
         web_search: TavilySearch | None = None,
         session_store: RedisSessionStore | None = None,
+        mcp_client: McpClient | None = None,
     ):
         # 依赖可注入，便于测试时替换为 Fake 实现
         self.llm = llm or OpenAILLMService()
@@ -97,13 +101,33 @@ class AgenticWorkflow:
         self.router = router or VectorToolRouter()
         self.web_search = web_search or TavilySearch()
         self.session_store = session_store or RedisSessionStore()
+        self.mcp_client = mcp_client or McpClient()
+        self._mcp_schemas: dict[str, dict[str, Any]] = {}
+        self._mcp_tools: dict[str, ToolSpec] = {}
         self._tools_registered = False
+        self._tools_lock = asyncio.Lock()
         self._graph = None
 
     async def _ensure_tools(self) -> None:
-        """首次路由前把默认工具注册到路由器（只执行一次）。"""
-        if not self._tools_registered:
-            await self.router.register_many(default_tool_specs())
+        """首次路由前把默认工具与 MCP 动态工具注册到路由器（只执行一次）。"""
+        if self._tools_registered:
+            return
+        async with self._tools_lock:
+            if self._tools_registered:
+                return
+            specs = default_tool_specs()
+            # MCP 中台未配置或不可用时静默降级，只保留内置工具，不阻断知识问答主链路。
+            if self.mcp_client.configured:
+                try:
+                    await self.mcp_client.initialize()
+                    mcp_specs, schemas = mcp_tool_specs(await self.mcp_client.list_tools())
+                    specs.extend(mcp_specs)
+                    self._mcp_schemas.update(schemas)
+                    self._mcp_tools.update({s.tool_id: s for s in mcp_specs})
+                except AppError:
+                    self._mcp_schemas = {}
+                    self._mcp_tools = {}
+            await self.router.register_many(specs)
             self._tools_registered = True
 
     def _current_task(self, state: GraphState) -> PlannedTask:
@@ -197,6 +221,8 @@ class AgenticWorkflow:
         tool_id = routing.get("selected_tool_id") if routing else None
         if tool_id == "web-search-agent":
             return "web_search"
+        if tool_id and tool_id.startswith("mcp:"):
+            return "mcp_call"
         if tool_id and tool_id != "rag-agent":
             return "complete_unsupported"
         return "retrieve"
@@ -243,6 +269,33 @@ class AgenticWorkflow:
         citations = state.get("citations", []) + [result.model_dump(mode="json") for result in results]
         out = {"citations": citations}
         self._emit_stream("web_search", out)
+        return out
+
+    async def _bind_mcp_arguments(self, tool_id: str, goal: str) -> dict[str, Any]:
+        """为 MCP 工具绑定调用入参：优先 LLM 按 schema 生成，失败退回确定性映射。"""
+        tool_name = tool_id.removeprefix("mcp:")
+        schema = self._mcp_schemas.get(tool_id, {})
+        description = self._mcp_tools.get(tool_id).description if tool_id in self._mcp_tools else ""
+        try:
+            return await self.llm.bind_tool_arguments(tool_name, description, schema, goal)
+        except AppError:
+            return bind_arguments(schema, goal)
+
+    async def mcp_call(self, state: GraphState) -> GraphState:
+        """调用 MCP 中台动态工具：把接口返回文本作为当前任务的回答。"""
+        routing = next((entry.get("routing") for entry in reversed(state.get("task_results", [])) if "routing" in entry), None)
+        tool_id = (routing or {}).get("selected_tool_id", "")
+        tool_name = tool_id.removeprefix("mcp:")
+        goal = state.get("task_query") or state.get("standalone_query", "")
+        arguments = await self._bind_mcp_arguments(tool_id, goal)
+        try:
+            text = await self.mcp_client.call_tool(tool_name, arguments)
+        except AppError as exc:
+            reason = f"{tool_name}: {exc.message}"
+            self._emit_stream("mcp_call", {"answer": "", "warnings": state.get("warnings", []) + [reason]})
+            return {"answer": f"接口调用失败：{exc.message}", "warnings": state.get("warnings", []) + [reason]}
+        out = {"answer": text}
+        self._emit_stream("mcp_call", out)
         return out
 
     async def generate(self, state: GraphState) -> GraphState:
@@ -323,6 +376,7 @@ class AgenticWorkflow:
         task_graph.add_node("retrieve", self.retrieve)
         task_graph.add_node("document_grade", self.document_grade)
         task_graph.add_node("web_search", self.web_search_node)
+        task_graph.add_node("mcp_call", self.mcp_call)
         task_graph.add_node("generate", self.generate)
         task_graph.add_node("answer_grade", self.answer_grade)
         task_graph.add_node("complete_task", self.complete_task)
@@ -331,11 +385,12 @@ class AgenticWorkflow:
         task_graph.add_conditional_edges(
             "route",
             self.routed_branch,
-            {"retrieve": "retrieve", "web_search": "web_search", "complete_unsupported": "complete_unsupported"},
+            {"retrieve": "retrieve", "web_search": "web_search", "mcp_call": "mcp_call", "complete_unsupported": "complete_unsupported"},
         )
         task_graph.add_edge("retrieve", "document_grade")
         task_graph.add_conditional_edges("document_grade", self.document_branch, {"generate": "generate", "web_search": "web_search"})
         task_graph.add_edge("web_search", "generate")
+        task_graph.add_edge("mcp_call", "complete_task")
         task_graph.add_edge("generate", "answer_grade")
         task_graph.add_conditional_edges("answer_grade", self.answer_branch, {"retrieve": "retrieve", "complete_task": "complete_task"})
         task_graph.add_edge("complete_task", END)
@@ -487,6 +542,9 @@ class AgenticWorkflow:
             citations = partial.get("citations", [])
             web_count = sum(1 for item in citations if item.get("source_type") == "web")
             return f"知识库证据不足，网络搜索补充 {web_count} 条来源"
+        if node_name == "mcp_call":
+            answer = partial.get("answer", "")
+            return f"MCP 工具返回：{answer[:200]}" + ("…" if len(answer) > 200 else "")
         if node_name == "generate":
             answer = partial.get("answer", "")
             return answer[:200] + ("…" if len(answer) > 200 else "")

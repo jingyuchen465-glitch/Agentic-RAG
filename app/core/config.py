@@ -33,6 +33,8 @@ class Settings:
     oss_endpoint: str | None
     oss_public_base_url: str | None
     tavily_api_key: str | None
+    mcp_base_url: str | None
+    mcp_token: str | None
     max_upload_size_mb: int
     retrieval_top_k: int
     router_threshold: float
@@ -91,6 +93,8 @@ def get_settings() -> Settings:
         oss_endpoint=_optional("OSS_ENDPOINT"),
         oss_public_base_url=_optional("OSS_PUBLIC_BASE_URL"),
         tavily_api_key=_optional("TAVILY_API_KEY"),
+        mcp_base_url=_optional("MCP_BASE_URL"),
+        mcp_token=_optional("MCP_TOKEN"),
         max_upload_size_mb=int(os.getenv("MAX_UPLOAD_SIZE_MB", "20")),
         retrieval_top_k=int(os.getenv("RETRIEVAL_TOP_K", "8")),
         router_threshold=float(os.getenv("ROUTER_THRESHOLD", "0.62")),
