@@ -118,6 +118,19 @@ class OpenAILLMService:
         )
         return bool(result.get("approved")), str(result.get("reason", ""))
 
+    async def bind_tool_arguments(
+        self, tool_name: str, description: str, input_schema: dict[str, Any], goal: str
+    ) -> dict[str, Any]:
+        """为 MCP 动态工具生成符合 JSON Schema 的调用入参（仅工具路由路径触发）。"""
+        schema = json.dumps(input_schema, ensure_ascii=False) if input_schema else "{}"
+        result = await self._json(
+            "Fill the arguments for an MCP tool call according to its input JSON Schema. "
+            "Use only the schema-provided fields. Return JSON only: the arguments object itself.\n"
+            f"Tool: {tool_name}\nDescription: {description}\nGoal: {goal}\n"
+            f"Input schema: {schema}"
+        )
+        return result if isinstance(result, dict) else {}
+
 
 class FakeLLMService:
     """工作流测试用的显式替身（test double），不发起真实模型调用。"""
@@ -133,3 +146,8 @@ class FakeLLMService:
 
     async def grade_answer(self, query: str, answer: str, citations: list[dict[str, Any]]) -> tuple[bool, str]:
         return True, "fake answer grade"
+
+    async def bind_tool_arguments(
+        self, tool_name: str, description: str, input_schema: dict[str, Any], goal: str
+    ) -> dict[str, Any]:
+        return {"query": goal}
