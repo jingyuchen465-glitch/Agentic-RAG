@@ -143,18 +143,24 @@ class DocumentIngestor:
 
     async def index(self, document_id: str, task_id: str) -> None:
         """执行完整索引流程，并同步更新任务与文档状态。"""
+        # 读取文档记录（含磁盘路径与文件名）；文档可能已被删除，查不到则静默返回
         document = self.repository.get_document(document_id)
         if not document:
             return
+        # 状态置为 running（同步更新 MySQL 任务与 Milvus 文档元数据）
         self.repository.update_status(document_id, task_id, "running")
         try:
+            # 解析+切分是 CPU/IO 密集的阻塞操作，放入线程池避免阻塞事件循环
             chunks = await asyncio.to_thread(self._parse, Path(str(document["path"])))
             if not chunks:
-                raise AppError("DOCUMENT_EMPTY", "No readable text was extracted from the document.")
+                raise AppError("DOCUMENT_EMPTY", "未从文档中提取可读文本。")
+            # 为每个 chunk 生成独立 chunk_id，作为 Milvus 主键
             chunks = [{"chunk_id": str(uuid.uuid4()), **chunk} for chunk in chunks]
             contents = [str(chunk["content"]) for chunk in chunks]
+            # 双路向量化：稠密向量（语义） + 稀疏向量（BM25 关键词），供混合检索使用
             vectors = await self.embedding.embed_many(contents)
             sparse_vectors = await self.embedding.sparse_embed_many(contents)
+            # 写库同样为阻塞调用：内部先按 document_id 删除旧向量再批量插入，保证重索引幂等
             await asyncio.to_thread(
                 self.indexer.replace_document,
                 document_id,
@@ -165,4 +171,5 @@ class DocumentIngestor:
             )
             self.repository.update_status(document_id, task_id, "completed")
         except Exception as exc:
+            # 失败原因截断至 1000 字符存入任务记录，避免异常信息撑爆字段
             self.repository.update_status(document_id, task_id, "failed", str(exc)[:1000])
