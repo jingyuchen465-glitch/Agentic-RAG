@@ -20,18 +20,24 @@ class KnowledgeService:
     async def upload(self, file: UploadFile) -> dict[str, str]:
         """校验文件类型与大小，落盘并登记文档与索引任务，返回两者的 ID。"""
         settings = get_settings()
+        # 仅允许白名单扩展名，避免不支持的格式进入解析管线
         suffix = Path(file.filename or "").suffix.lower()
         if suffix not in {".pdf", ".docx", ".txt", ".md", ".markdown"}:
             raise AppError("UNSUPPORTED_FILE_TYPE", "Only PDF, DOCX, TXT, and Markdown files are supported.")
+        # 一次性读入内存以校验大小（受 MAX_UPLOAD_SIZE_MB 限制）
         content = await file.read()
         max_bytes = settings.max_upload_size_mb * 1024 * 1024
         if len(content) > max_bytes:
             raise AppError("FILE_TOO_LARGE", f"File exceeds {settings.max_upload_size_mb} MB.")
+        # 文档与任务各自独立 ID，便于后续异步索引与状态追踪
         document_id, task_id = str(uuid.uuid4()), str(uuid.uuid4())
+        # 落盘路径以 document_id 命名，天然避免文件名冲突
         settings.upload_dir.mkdir(parents=True, exist_ok=True)
         target = settings.upload_dir / f"{document_id}{suffix}"
         target.write_bytes(content)
+        # 登记文档元数据（Milvus）与索引任务（MySQL），初始状态为 queued
         self.repository.create_document(document_id, file.filename or target.name, str(target), task_id)
+        # 真正的解析/向量化由调用方（BackgroundTasks）异步执行，这里只返回 ID
         return {"document_id": document_id, "task_id": task_id}
 
     def list_files(self, page: int, size: int) -> dict[str, object]:
