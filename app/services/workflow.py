@@ -8,14 +8,14 @@ from typing import Annotated, Any, TypedDict
 
 from app.core.config import get_settings
 from app.core.errors import AppError
-from app.domain.models import AgentType, ChatRequest, ChatResult, Citation, PlannedTask, ToolSpec
+from app.domain.models import ChatRequest, ChatResult, Citation, PlannedTask, ToolSpec
 from app.harness.contracts import HarnessLimitError, RunContext
 from app.harness.plan_validator import validate_plan
 from app.services.llm import OpenAILLMService
 from app.services.mcp_client import McpClient, bind_arguments
 from app.services.retrieval import ConfiguredHybridRetriever, HybridRetriever
-from app.services.tool_router import VectorToolRouter, default_tool_specs, mcp_tool_specs
 from app.services.session import RedisSessionStore
+from app.services.tool_router import VectorToolRouter, default_tool_specs, mcp_tool_specs
 from app.services.web_search import TavilySearch
 
 
