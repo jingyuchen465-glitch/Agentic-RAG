@@ -1,4 +1,4 @@
-# Agentic RAG — 基于 LangGraph 的智能检索增强知识库服务
+# Harness RAG — 基于 LangGraph 的智能检索增强知识库服务
 
 一个生产级 Agentic RAG 服务：**计划(plan) → 调度(schedule) → 向量工具路由 → 并行检索 → 双重评估 → 聚合生成**。它不只是一个"检索再生成"的普通 RAG，而是把用户问题先改写、再分解成可依赖的任务 DAG，通过 LangGraph 并行调度执行，并在检索与生成两个环节都加入了质量评估和重试循环。
 
