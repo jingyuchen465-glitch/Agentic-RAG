@@ -194,6 +194,20 @@ ROUTER_AMBIGUITY_DELTA=0.05    # 与次高分的最小差距，避免歧义
 RETRIEVAL_GROUNDED_THRESHOLD=0.35
 MAX_AGENT_RETRIES=2            # 回答评分未通过的最大重试次数
 SESSION_TTL_SECONDS=3600
+HARNESS_MAX_STEPS=32             # 单次运行允许执行的最大节点数
+HARNESS_TIMEOUT_SECONDS=120      # 单次运行 deadline（秒）
+HARNESS_MAX_PLAN_TASKS=16        # LLM 计划允许的最大任务数
+```
+
+## Harness 运行控制
+
+工作流内置 Harness 控制面：每次请求生成独立 `run_id`，对 LLM 计划执行任务 ID、依赖、环检测和任务数量校验，并在每个节点消耗步骤预算。超过步骤或 deadline 会以 `HARNESS_BUDGET_EXCEEDED` 失败，避免异常计划造成无限执行。SSE trace 事件包含 `run_id`，便于把同一次运行的节点轨迹关联起来。
+
+离线回归可复用生产工作流和 Fake 适配器：
+
+```python
+from app.harness.evaluation import EvalCase, run_evaluation
+report = await run_evaluation(workflow, [EvalCase("问题", ("期望片段",), 1)])
 ```
 
 ## 默认注册的工具

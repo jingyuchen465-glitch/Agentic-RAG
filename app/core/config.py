@@ -48,6 +48,10 @@ class Settings:
     pdf_ocr_language: str
     pdf_render_dpi: int
     pdf_concurrency: int
+    harness_max_steps: int
+    harness_timeout_seconds: float
+    harness_max_plan_tasks: int
+>>>>>>> f63cdf9 (feat: add workflow harness controls and evaluation)
 
     def missing_runtime_settings(self) -> list[str]:
         """返回尚未配置的外部服务环境变量名，用于健康检查与启动校验。"""
@@ -102,10 +106,13 @@ def get_settings() -> Settings:
         retrieval_grounded_threshold=float(os.getenv("RETRIEVAL_GROUNDED_THRESHOLD", "0.35")),
         max_agent_retries=int(os.getenv("MAX_AGENT_RETRIES", "2")),
         session_ttl_seconds=int(os.getenv("SESSION_TTL_SECONDS", "3600")),
+<<<<<<< HEAD
         chunk_size=int(os.getenv("CHUNK_SIZE", "800")),
         chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "120")),
         max_chunk_size=int(os.getenv("MAX_CHUNK_SIZE", "2000")),
         pdf_ocr_language=os.getenv("PDF_OCR_LANGUAGE", "ch"),
         pdf_render_dpi=int(os.getenv("PDF_RENDER_DPI", "144")),
-        pdf_concurrency=max(1, int(os.getenv("PDF_CONCURRENCY", "4"))),
+        harness_max_steps=int(os.getenv("HARNESS_MAX_STEPS", "32")),
+        harness_timeout_seconds=float(os.getenv("HARNESS_TIMEOUT_SECONDS", "120")),
+        harness_max_plan_tasks=int(os.getenv("HARNESS_MAX_PLAN_TASKS", "16")),
     )

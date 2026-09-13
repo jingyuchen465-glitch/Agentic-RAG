@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
 import operator
+import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated, Any, TypedDict
 
 from app.core.config import get_settings
 from app.core.errors import AppError
 from app.domain.models import AgentType, ChatRequest, ChatResult, Citation, PlannedTask, ToolSpec
+from app.harness.contracts import HarnessLimitError, RunContext
+from app.harness.plan_validator import validate_plan
 from app.services.llm import OpenAILLMService
 from app.services.mcp_client import McpClient, bind_arguments
 from app.services.retrieval import ConfiguredHybridRetriever, HybridRetriever
 from app.services.tool_router import VectorToolRouter, default_tool_specs, mcp_tool_specs
-from app.services.web_search import TavilySearch
 from app.services.session import RedisSessionStore
+from app.services.web_search import TavilySearch
 
 
 class GraphState(TypedDict, total=False):
@@ -36,6 +38,7 @@ class GraphState(TypedDict, total=False):
     retry_counts: dict[str, int]
     document_grade_reason: str
     answer_grade_reason: str
+    run_context: RunContext
 
 
 class TaskState(TypedDict, total=False):
@@ -59,6 +62,7 @@ class TaskState(TypedDict, total=False):
     answer_grade_reason: str
     document_grounded: bool
     answer_approved: bool
+    run_context: RunContext
 
 
 class TaskOut(TypedDict, total=False):
@@ -140,6 +144,7 @@ class AgenticWorkflow:
 
     async def rewrite(self, state: GraphState) -> GraphState:
         """改写查询为独立查询、生成检索子查询并识别意图（一次调用）。"""
+        self._consume_step(state, "rewrite")
         info = await self.llm.understand(state["original_query"])
         return {
             "standalone_query": info["standalone_query"],
@@ -149,7 +154,10 @@ class AgenticWorkflow:
 
     async def plan(self, state: GraphState) -> GraphState:
         """生成任务 DAG，并初始化任务结果与重试计数。"""
+        self._consume_step(state, "plan")
         tasks = await self.llm.plan(state["standalone_query"], state["intent"])
+        settings = get_settings()
+        tasks = validate_plan(tasks, max_tasks=settings.harness_max_plan_tasks)
         return {"tasks": [task.model_dump(mode="json") for task in tasks], "task_results": [], "retry_counts": {}}
 
     def _ready_tasks(self, state: GraphState) -> list[dict[str, Any]]:
@@ -163,6 +171,7 @@ class AgenticWorkflow:
 
     def schedule(self, state: GraphState) -> GraphState:
         """调度节点：仅统计待执行任务数供流式观测，真正的并行派发在 dispatch。"""
+        self._consume_step(state, "schedule")
         return {"pending": len(self._ready_tasks(state))}
 
     def dispatch(self, state: GraphState) -> list[Any]:
@@ -178,6 +187,7 @@ class AgenticWorkflow:
                         "session_id": state.get("session_id"),
                         "standalone_query": state.get("standalone_query", ""),
                         "task_results": state.get("task_results", []),
+                        "run_context": state.get("run_context"),
                     },
                 )
             ]
@@ -197,6 +207,7 @@ class AgenticWorkflow:
                     "task_query": task.get("goal") or base_queries[0],
                     "warnings": [],
                     "retry_counts": {},
+                    "run_context": state.get("run_context"),
                 },
             )
             for task in ready
@@ -204,6 +215,7 @@ class AgenticWorkflow:
 
     async def route(self, state: GraphState) -> GraphState:
         """对当前任务做向量路由；无可用工具时记录警告并置空答案。"""
+        self._consume_step(state, "route")
         await self._ensure_tools()
         task = self._current_task(state)
         decision = await self.router.route(task)
@@ -229,6 +241,7 @@ class AgenticWorkflow:
 
     async def retrieve(self, state: GraphState) -> GraphState:
         """混合检索：基于任务自身查询返回知识库引用及最高相关度。"""
+        self._consume_step(state, "retrieve")
         query = state.get("task_query") or (state.get("retrieval_queries") or [""])[0]
         chunks = await self.retriever.retrieve(query, get_settings().retrieval_top_k)
         citations = [chunk.citation.model_dump(mode="json") for chunk in chunks]
@@ -243,6 +256,7 @@ class AgenticWorkflow:
 
     async def document_grade(self, state: GraphState) -> GraphState:
         """文档评分：按检索相关度确定性判定证据是否充分，并给出可读理由。"""
+        self._consume_step(state, "document_grade")
         count = len(state.get("citations", []))
         relevance = float(state.get("max_relevance", 0.0))
         threshold = get_settings().retrieval_grounded_threshold
@@ -260,10 +274,11 @@ class AgenticWorkflow:
 
     def document_branch(self, state: GraphState) -> str:
         """文档评分分支：证据充分则生成回答，否则转网络搜索。"""
-        return "generate" if not state.get("warnings", []) or "Knowledge-base evidence was insufficient." not in state["warnings"] else "web_search"
+        return "generate" if state.get("document_grounded", False) else "web_search"
 
     async def web_search_node(self, state: GraphState) -> GraphState:
         """网络搜索节点：基于任务自身查询把搜索结果并入引用列表。"""
+        self._consume_step(state, "web_search")
         query = state.get("task_query") or state.get("standalone_query", "")
         results = await self.web_search.search(query)
         citations = state.get("citations", []) + [result.model_dump(mode="json") for result in results]
@@ -300,6 +315,7 @@ class AgenticWorkflow:
 
     async def generate(self, state: GraphState) -> GraphState:
         """基于引用生成当前任务的回答。"""
+        self._consume_step(state, "generate")
         query = state.get("task_query") or state.get("standalone_query", "")
         answer = await self.llm.generate(query, state.get("citations", []))
         out = {"answer": answer}
@@ -308,6 +324,7 @@ class AgenticWorkflow:
 
     async def answer_grade(self, state: GraphState) -> GraphState:
         """回答评分：未通过则累计该任务的重试次数并追加警告。"""
+        self._consume_step(state, "answer_grade")
         query = state.get("task_query") or state.get("standalone_query", "")
         approved, reason = await self.llm.grade_answer(query, state["answer"], state.get("citations", []))
         task = self._current_task(state)
@@ -322,12 +339,15 @@ class AgenticWorkflow:
         """回答评分分支：重试未超限则重新检索，否则完成当前任务。"""
         task_id = state["active_task_id"]
         retry_count = state.get("retry_counts", {}).get(task_id or "", 0)
+        context = state.get("run_context")
+        max_retries = context.max_retries if isinstance(context, RunContext) else get_settings().max_agent_retries
         if state.get("warnings", []) and state["warnings"][-1].startswith("Answer requires revision"):
-            return "retrieve" if retry_count <= get_settings().max_agent_retries else "complete_task"
+            return "retrieve" if retry_count <= max_retries else "complete_task"
         return "complete_task"
 
     async def complete_task(self, state: GraphState) -> GraphState:
         """将当前任务的答案/引用/警告作为一条增量写入任务结果，供收尾汇总。"""
+        self._consume_step(state, "complete_task")
         task = self._current_task(state)
         return {
             "task_results": [
@@ -343,6 +363,7 @@ class AgenticWorkflow:
 
     async def complete_unsupported(self, state: GraphState) -> GraphState:
         """当前任务选中的工具不可用：将失败结果作为增量写入任务结果。"""
+        self._consume_step(state, "complete_unsupported")
         task = self._current_task(state)
         routing = next((entry.get("routing") for entry in reversed(state.get("task_results", [])) if "routing" in entry), None)
         reason = routing.get("reason", "") if routing else ""
@@ -351,6 +372,7 @@ class AgenticWorkflow:
 
     async def finalize(self, state: GraphState) -> GraphState:
         """收尾：汇总各任务答案、引用与警告；无答案时给出兜底文案。"""
+        self._consume_step(state, "finalize")
         results = state.get("task_results", [])
         answers = [item["answer"] for item in results if item.get("answer")]
         citations = [c for item in results for c in item.get("citations", [])]
@@ -417,9 +439,20 @@ class AgenticWorkflow:
         if self._graph is None:
             self._graph = self._build_graph()
         session_id = request.session_id or str(uuid.uuid4())
-        state = await self._graph.ainvoke(
-            {"session_id": session_id, "original_query": request.query, "warnings": [], "citations": []}
+        context = RunContext(
+            max_steps=get_settings().harness_max_steps,
+            max_retries=get_settings().max_agent_retries,
+            timeout_seconds=get_settings().harness_timeout_seconds,
         )
+        try:
+            state = await asyncio.wait_for(
+                self._graph.ainvoke(
+                    {"session_id": session_id, "original_query": request.query, "warnings": [], "citations": [], "run_context": context}
+                ),
+                timeout=context.timeout_seconds,
+            )
+        except TimeoutError as exc:
+            raise AppError("HARNESS_TIMEOUT", "Workflow deadline exceeded.", 504) from exc
         await self.session_store.save(session_id, {"query": request.query, "answer": state["answer"]})
         return ChatResult(
             session_id=session_id,
@@ -434,8 +467,13 @@ class AgenticWorkflow:
         if self._graph is None:
             self._graph = self._build_graph()
         session_id = request.session_id or str(uuid.uuid4())
-        yield {"event": "metadata", "data": {"session_id": session_id}}
-        seed = {"session_id": session_id, "original_query": request.query, "warnings": [], "citations": []}
+        context = RunContext(
+            max_steps=get_settings().harness_max_steps,
+            max_retries=get_settings().max_agent_retries,
+            timeout_seconds=get_settings().harness_timeout_seconds,
+        )
+        yield {"event": "metadata", "data": {"session_id": session_id, "run_id": context.run_id}}
+        seed = {"session_id": session_id, "original_query": request.query, "warnings": [], "citations": [], "run_context": context}
         state: dict[str, Any] = dict(seed)
         # subgraphs=True 把各并行任务子图内的节点事件也上抛；finalize 节点会聚合所有任务结果纠正最终状态
         # 组合 stream_mode + subgraphs 时每个事件为 (namespace, mode, value) 三元组：
@@ -443,7 +481,9 @@ class AgenticWorkflow:
         #   - custom 由子图内任务节点（route/retrieve/grade/generate 等）主动上抛，作为 trace 展示
         async for namespace, mode, value in self._graph.astream(seed, stream_mode=["updates", "custom"], subgraphs=True):
             if mode == "custom":
-                yield {"event": "trace", "data": {k: value[k] for k in ("node", "label", "output", "tool", "score") if k in value}}
+                trace = {k: value[k] for k in ("node", "label", "output", "tool", "score") if k in value}
+                trace["run_id"] = context.run_id
+                yield {"event": "trace", "data": trace}
                 continue
             if namespace:  # 子图内的 updates 已改由 custom 上抛，跳过避免重复
                 continue
@@ -481,13 +521,27 @@ class AgenticWorkflow:
         label = _TRACE_LABELS.get(node_name)
         if not label:
             return None
+        context = partial.get("run_context")
+        run_id = context.run_id if isinstance(context, RunContext) else None
         data: dict[str, Any] = {"node": node_name, "label": label, "output": self._node_output(node_name, partial)}
+        if run_id:
+            data["run_id"] = run_id
         if node_name == "route":
             routing = next((entry.get("routing") for entry in partial.get("task_results", []) if "routing" in entry), None)
             if routing:
                 data["tool"] = routing.get("selected_tool_id")
                 data["score"] = routing.get("score")
         return {"event": "trace", "data": data}
+
+    @staticmethod
+    def _consume_step(state: GraphState | TaskState, node: str) -> None:
+        """Enforce the per-run step/deadline budget inside every executable node."""
+        context = state.get("run_context")
+        if isinstance(context, RunContext):
+            try:
+                context.consume_step(node)
+            except HarnessLimitError as exc:
+                raise AppError("HARNESS_BUDGET_EXCEEDED", str(exc), 429) from exc
 
     @staticmethod
     def _emit_stream(node_name: str, partial: dict[str, Any]) -> None:
@@ -499,7 +553,7 @@ class AgenticWorkflow:
         try:
             from langgraph.config import get_stream_writer
             writer = get_stream_writer()
-        except Exception:
+        except (ImportError, RuntimeError, LookupError):
             return
         data: dict[str, Any] = {"type": "trace", "node": node_name, "label": label, "output": AgenticWorkflow._node_output(node_name, partial)}
         if node_name == "route":
